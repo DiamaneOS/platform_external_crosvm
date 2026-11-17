@@ -136,6 +136,10 @@ pub struct DiskOption {
 
     /// Specify PCI address will be used to attach this device
     pub pci_address: Option<PciAddress>,
+
+    /// Open the disk as raw, never guessing its format from its contents.
+    #[serde(default)]
+    pub raw: bool,
 }
 
 impl Default for DiskOption {
@@ -156,6 +160,7 @@ impl Default for DiskOption {
             packed_queue: false,
             bootindex: None,
             pci_address: None,
+            raw: false,
         }
     }
 }
@@ -216,6 +221,7 @@ mod tests {
                 packed_queue: false,
                 bootindex: None,
                 pci_address: None,
+                raw: false,
             }
         );
 
@@ -239,6 +245,7 @@ mod tests {
                 packed_queue: false,
                 bootindex: Some(5),
                 pci_address: None,
+                raw: false,
             }
         );
 
@@ -262,6 +269,7 @@ mod tests {
                 packed_queue: false,
                 bootindex: None,
                 pci_address: None,
+                raw: false,
             }
         );
 
@@ -285,6 +293,7 @@ mod tests {
                 packed_queue: false,
                 bootindex: None,
                 pci_address: None,
+                raw: false,
             }
         );
 
@@ -308,6 +317,7 @@ mod tests {
                 packed_queue: false,
                 bootindex: None,
                 pci_address: None,
+                raw: false,
             }
         );
 
@@ -331,6 +341,7 @@ mod tests {
                 packed_queue: false,
                 bootindex: None,
                 pci_address: None,
+                raw: false,
             }
         );
         let params = from_block_arg("/some/path.img,sparse=false").unwrap();
@@ -352,6 +363,7 @@ mod tests {
                 packed_queue: false,
                 bootindex: None,
                 pci_address: None,
+                raw: false,
             }
         );
 
@@ -375,6 +387,7 @@ mod tests {
                 packed_queue: false,
                 bootindex: None,
                 pci_address: None,
+                raw: false,
             }
         );
 
@@ -398,6 +411,7 @@ mod tests {
                 packed_queue: false,
                 bootindex: None,
                 pci_address: None,
+                raw: false,
             }
         );
 
@@ -421,6 +435,7 @@ mod tests {
                 packed_queue: false,
                 bootindex: None,
                 pci_address: None,
+                raw: false,
             }
         );
 
@@ -444,6 +459,7 @@ mod tests {
                 packed_queue: false,
                 bootindex: None,
                 pci_address: None,
+                raw: false,
             }
         );
 
@@ -468,6 +484,7 @@ mod tests {
                     packed_queue: false,
                     bootindex: None,
                     pci_address: None,
+                    raw: false,
                 }
             );
             let params = from_block_arg("/some/path.img,async-executor=overlapped").unwrap();
@@ -488,6 +505,7 @@ mod tests {
                     packed_queue: false,
                     bootindex: None,
                     pci_address: None,
+                    raw: false,
                 }
             );
             let params =
@@ -515,6 +533,7 @@ mod tests {
                     packed_queue: false,
                     bootindex: None,
                     pci_address: None,
+                    raw: false,
                 }
             );
         }
@@ -539,6 +558,7 @@ mod tests {
                 packed_queue: false,
                 bootindex: None,
                 pci_address: None,
+                raw: false,
             }
         );
         let err = from_block_arg("/some/path.img,id=DISK_ID_IS_WAY_TOO_LONG").unwrap_err();
@@ -575,6 +595,7 @@ mod tests {
                 packed_queue: false,
                 bootindex: None,
                 pci_address: None,
+                raw: false,
             }
         );
 
@@ -598,6 +619,7 @@ mod tests {
                 packed_queue: true,
                 bootindex: None,
                 pci_address: None,
+                raw: false,
             }
         );
 
@@ -625,6 +647,7 @@ mod tests {
                     dev: 1,
                     func: 1,
                 }),
+                raw: false,
             }
         );
 
@@ -648,6 +671,7 @@ mod tests {
                 packed_queue: false,
                 bootindex: None,
                 pci_address: None,
+                raw: false,
             }
         );
         // lock=false
@@ -670,6 +694,7 @@ mod tests {
                 packed_queue: false,
                 bootindex: None,
                 pci_address: None,
+                raw: false,
             }
         );
 
@@ -701,6 +726,7 @@ mod tests {
                     dev: 1,
                     func: 1,
                 }),
+                raw: false,
             }
         );
     }
@@ -724,6 +750,7 @@ mod tests {
             packed_queue: false,
             bootindex: None,
             pci_address: None,
+            raw: false,
         };
         let json = serde_json::to_string(&original).unwrap();
         let deserialized = serde_json::from_str(&json).unwrap();
@@ -746,6 +773,7 @@ mod tests {
             packed_queue: false,
             bootindex: None,
             pci_address: None,
+            raw: false,
         };
         let json = serde_json::to_string(&original).unwrap();
         let deserialized = serde_json::from_str(&json).unwrap();
@@ -768,6 +796,7 @@ mod tests {
             packed_queue: false,
             bootindex: None,
             pci_address: None,
+            raw: false,
         };
         let json = serde_json::to_string(&original).unwrap();
         let deserialized = serde_json::from_str(&json).unwrap();

@@ -25,7 +25,7 @@ pub fn get_seg_max(queue_size: u16) -> u32 {
 impl DiskOption {
     /// Open the specified disk file.
     pub fn open(&self) -> anyhow::Result<Box<dyn DiskFile>> {
-        disk::open_disk_file(disk::DiskFileParams {
+        let params = disk::DiskFileParams {
             path: self.path.clone(),
             is_read_only: self.read_only,
             is_sparse_file: self.sparse,
@@ -33,8 +33,12 @@ impl DiskOption {
             is_direct: self.direct,
             lock: self.lock,
             depth: 0,
-        })
-        .context("open_disk_file failed")
+        };
+        if self.raw {
+            disk::open_raw_disk_file(params).context("open_raw_disk_file failed")
+        } else {
+            disk::open_disk_file(params).context("open_disk_file failed")
+        }
     }
 }
 
