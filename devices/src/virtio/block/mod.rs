@@ -190,6 +190,20 @@ mod tests {
     }
 
     #[test]
+    fn params_raw_and_direct() {
+        // DiamaneOS: a filesystem VM's disk, as virtmgr passes it (android/virtmgr/src/crosvm.rs).
+        let params =
+            from_block_arg("path=/proc/self/fd/7,ro=false,lock=false,direct=true,raw=true").unwrap();
+        assert!(params.raw);
+        assert!(params.direct);
+        assert!(!params.read_only);
+        assert!(!params.lock);
+        // Off unless asked for, and only a boolean.
+        assert!(!from_block_arg("/some/path.img").unwrap().raw);
+        assert!(from_block_arg("/some/path.img,raw=yes").is_err());
+    }
+
+    #[test]
     fn params_from_key_values() {
         // Path argument is mandatory.
         let err = from_block_arg("").unwrap_err();
