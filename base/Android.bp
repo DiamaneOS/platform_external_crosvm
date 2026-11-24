@@ -225,7 +225,11 @@ rust_library {
         "libbase_event_token_derive",
         "libremain",
     ],
-    apex_available: ["com.android.virt"],
+    apex_available: [
+        // DiamaneOS: fsvmd, a platform binary, uses libfuse_rust (cargo_embargo.json)
+        "//apex_available:platform",
+        "com.android.virt",
+    ],
     target: {
         android: {
             rustlibs: ["libandroid_log_sys"],

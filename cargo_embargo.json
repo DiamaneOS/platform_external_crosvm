@@ -101,7 +101,11 @@
     "libfuse_rust": [
         "//packages/modules/Virtualization/guest/authfs",
         "//packages/modules/Virtualization/guest/zipfuse",
-        "//packages/modules/Virtualization/tests/authfs"
+        "//packages/modules/Virtualization/tests/authfs",
+        // DiamaneOS: fsvmd (vendor/diamaneos/fsvm). Its dependencies base, audio_streams, sync, cros_tracing,
+        // cros_tracing_types and fuse also carry "//apex_available:platform" in their Android.bp, which a
+        // regeneration drops: add it again there (fsvmd is a platform binary).
+        "//vendor:__subpackages__"
     ]
   },
   "package": {

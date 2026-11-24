@@ -63,8 +63,15 @@ rust_library {
         "libenumn",
         "libremain",
     ],
-    apex_available: ["com.android.virt"],
+    apex_available: [
+        // DiamaneOS: fsvmd, a platform binary (cargo_embargo.json)
+        "//apex_available:platform",
+        "com.android.virt",
+    ],
     visibility: [
+        // DiamaneOS: fsvmd (vendor/diamaneos/fsvm) serves SD cards and USB drives from the filesystem VM. Soong
+        // only lets packages outside vendor/ name all of vendor/.
+        "//vendor:__subpackages__",
         "//packages/modules/Virtualization/guest/authfs",
         "//packages/modules/Virtualization/guest/zipfuse",
         "//packages/modules/Virtualization/tests/authfs",

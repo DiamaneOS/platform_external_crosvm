@@ -303,6 +303,14 @@ pub struct DiskFileParams {
     pub depth: u32,
 }
 
+/// DiamaneOS: opens a disk file as raw, without looking at its contents. For disks from an untrusted source, whose
+/// first bytes must never select a parser (qcow2, composite disk, Android sparse, zstd).
+pub fn open_raw_disk_file(params: DiskFileParams) -> Result<Box<dyn DiskFile>> {
+    let raw_image = sys::open_raw_disk_image(&params)?;
+    sys::apply_raw_disk_file_options(&raw_image, params.is_sparse_file)?;
+    Ok(Box::new(raw_image) as Box<dyn DiskFile>)
+}
+
 /// Inspect the image file type and create an appropriate disk file to match it.
 pub fn open_disk_file(params: DiskFileParams) -> Result<Box<dyn DiskFile>> {
     if params.depth > MAX_NESTING_DEPTH {

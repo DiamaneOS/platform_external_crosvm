@@ -25,5 +25,9 @@ rust_library {
         "libanyhow",
         "libsync_rust",
     ],
-    apex_available: ["com.android.virt"],
+    apex_available: [
+        // DiamaneOS: fsvmd, a platform binary, uses libfuse_rust (cargo_embargo.json)
+        "//apex_available:platform",
+        "com.android.virt",
+    ],
 }

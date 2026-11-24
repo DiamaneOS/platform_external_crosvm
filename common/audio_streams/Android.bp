@@ -55,5 +55,9 @@ rust_library {
         "libasync_trait",
         "libremain",
     ],
-    apex_available: ["com.android.virt"],
+    apex_available: [
+        // DiamaneOS: fsvmd, a platform binary, uses libfuse_rust (cargo_embargo.json)
+        "//apex_available:platform",
+        "com.android.virt",
+    ],
 }
