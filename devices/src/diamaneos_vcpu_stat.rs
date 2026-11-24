@@ -7,36 +7,65 @@
 //! time. crosvm's seccomp filter (src/crosvm/sys/linux/diamaneos_seccomp.rs) refuses openat once
 //! the vCPUs run. So run_control opens each vCPU thread's file here, right before the filter goes
 //! on, and the watchdog reads it again from the start with pread. procfs builds the contents
-//! afresh on each read from offset 0, so the guest time is always current.
+//! afresh on each read from offset 0, so the guest time is always current. Either every file
+//! opens or none is kept, and run_control does not start the VM then. Once sealed, right before
+//! the filter, a thread without a file gets an error, never a path open the filter would refuse.
 
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
-/// The open stat files by (process id, thread id).
-static FILES: Mutex<BTreeMap<(u32, u32), Arc<File>>> = Mutex::new(BTreeMap::new());
+type Files = BTreeMap<(u32, u32), Arc<File>>;
 
-fn files() -> MutexGuard<'static, BTreeMap<(u32, u32), Arc<File>>> {
+/// The open stat files by (process id, thread id).
+static FILES: Mutex<Files> = Mutex::new(BTreeMap::new());
+
+/// Set by `seal`: from then on no stat file is opened by path.
+static SEALED: AtomicBool = AtomicBool::new(false);
+
+fn files() -> MutexGuard<'static, Files> {
     FILES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Opens the stat file of each thread. A thread opened again gets its new file.
+/// Opens the stat file of each thread, all or none: on an error no file of this call is kept. A
+/// thread opened again gets its new file.
 pub fn open(pid_tids: impl IntoIterator<Item = (u32, u32)>) -> io::Result<()> {
+    let mut opened = Vec::new();
     for (pid, tid) in pid_tids {
         let file = File::open(format!("/proc/{pid}/task/{tid}/stat"))?;
-        files().insert((pid, tid), Arc::new(file));
+        opened.push(((pid, tid), Arc::new(file)));
     }
+    files().extend(opened);
     Ok(())
 }
 
-/// The thread's stat file as it reads now, or None when `open` did not open it.
+/// No stat file is opened by path from now on (run_control, right before the seccomp filter).
+pub fn seal() {
+    SEALED.store(true, Ordering::Release);
+}
+
+/// The thread's stat file as it reads now. None when `open` did not open it and nothing is sealed
+/// yet (the caller may open it by path), an error when sealed.
 pub fn read(pid: u32, tid: u32) -> Option<io::Result<String>> {
-    let file = files().get(&(pid, tid)).cloned()?;
-    Some(read_from_start(&file))
+    let found = lookup(&files(), (pid, tid), SEALED.load(Ordering::Acquire))?;
+    Some(found.and_then(|file| read_from_start(&file)))
+}
+
+fn lookup(files: &Files, key: (u32, u32), sealed: bool) -> Option<io::Result<Arc<File>>> {
+    match files.get(&key) {
+        Some(file) => Some(Ok(file.clone())),
+        None if sealed => Some(Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no stat file opened for vCPU thread {} of {}", key.1, key.0),
+        ))),
+        None => None,
+    }
 }
 
 fn read_from_start(file: &File) -> io::Result<String> {
@@ -149,6 +178,31 @@ mod tests {
         }
         let e = File::open("/proc/self/stat").unwrap_err();
         assert_eq!(e.raw_os_error(), Some(libc::EPERM), "the filter is not on");
+    }
+
+    /// A failed open keeps none of the call's files, so a partial set never seals.
+    #[test]
+    fn open_all_or_none() {
+        thread::spawn(|| {
+            let (pid, tid) = (process::id(), gettid() as u32);
+            let _forget = Opened(pid, tid);
+            assert!(open([(pid, tid), (pid, u32::MAX)]).is_err());
+            assert!(
+                read(pid, tid).is_none(),
+                "a file of the failed call was kept"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Once sealed, a thread without a file is an error, not a path open.
+    #[test]
+    fn sealed_miss_is_an_error() {
+        let empty = Files::new();
+        assert!(lookup(&empty, (1, 2), false).is_none());
+        let e = lookup(&empty, (1, 2), true).unwrap().unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]

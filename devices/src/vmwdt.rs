@@ -9,6 +9,8 @@
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::fs;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +18,6 @@ use anyhow::Context;
 use base::custom_serde::serialize_arc_mutex;
 use base::debug;
 use base::error;
-use base::warn;
 use base::AsRawDescriptor;
 use base::Descriptor;
 use base::Error as SysError;
@@ -93,7 +94,8 @@ struct VmwdtPerCpuRestore {
 pub struct Vmwdt {
     vm_wdts: Arc<Mutex<Vec<VmwdtPerCpu>>>,
     // The worker thread that waits on the timer fd
-    worker_thread: Option<WorkerThread<Tube>>,
+    // DiamaneOS: it hands back its tube, or None when it failed (no panic).
+    worker_thread: Option<WorkerThread<Option<Tube>>>,
     // TODO: @sebastianene add separate reset event for the watchdog
     // Reset source if the device is not responding
     reset_evt_wrtube: SendTube,
@@ -101,6 +103,10 @@ pub struct Vmwdt {
     // Event to be used to interrupt the guest on detected stalls
     stall_evt: IrqEdgeEvent,
     vm_ctrl_tube: Option<Tube>,
+    // DiamaneOS: whether a refused guest access was logged (only the first one is).
+    diamaneos_refused: AtomicBool,
+    // DiamaneOS: a worker failure is terminal and reports a device failure to the VMM.
+    diamaneos_worker_failed: Arc<AtomicBool>,
 }
 
 #[derive(Serialize)]
@@ -146,6 +152,8 @@ impl Vmwdt {
             activated: false,
             stall_evt: evt,
             vm_ctrl_tube: Some(vm_ctrl_tube),
+            diamaneos_refused: AtomicBool::new(false),
+            diamaneos_worker_failed: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -267,40 +275,88 @@ impl Vmwdt {
 
     fn start(&mut self, worker_started_send: Option<SendTube>) -> anyhow::Result<()> {
         let vm_wdts = self.vm_wdts.clone();
-        let reset_evt_wrtube = self.reset_evt_wrtube.try_clone().unwrap();
-        let stall_event = self.stall_evt.try_clone().unwrap();
+        let reset_evt_wrtube = self
+            .reset_evt_wrtube
+            .try_clone()
+            .context("failed to clone reset tube")?;
+        let stall_event = self
+            .stall_evt
+            .try_clone()
+            .context("failed to clone stall event")?;
         let vm_ctrl_tube = self
             .vm_ctrl_tube
             .take()
             .context("missing vm control tube")?;
 
+        let failure_tube = self
+            .reset_evt_wrtube
+            .try_clone()
+            .context("clone failure tube")?;
+        let failed = self.diamaneos_worker_failed.clone();
+        self.worker_thread = Some(
+            WorkerThread::try_start("vmwdt worker", move |kill_evt| {
+                Vmwdt::vmwdt_worker_thread(
+                    vm_wdts,
+                    kill_evt,
+                    reset_evt_wrtube,
+                    stall_event,
+                    vm_ctrl_tube,
+                    worker_started_send,
+                )
+                // DiamaneOS: a failed worker is logged, it does not panic.
+                .map_err(|e| {
+                    error!("vmwdt worker failed: {e:#}");
+                    failed.store(true, Ordering::Release);
+                    if let Err(e) = failure_tube.send(&VmEventType::DeviceCrashed) {
+                        error!("vmwdt failure notification: {e:#}");
+                    }
+            })
+            .ok()
+            })
+            .context("allocate vmwdt worker")?,
+        );
         self.activated = true;
-        self.worker_thread = Some(WorkerThread::start("vmwdt worker", |kill_evt| {
-            Vmwdt::vmwdt_worker_thread(
-                vm_wdts,
-                kill_evt,
-                reset_evt_wrtube,
-                stall_event,
-                vm_ctrl_tube,
-                worker_started_send,
-            )
-            .expect("failed to start vmwdt worker thread")
-        }));
         Ok(())
     }
 
-    fn ensure_started(&mut self) {
-        if self.worker_thread.is_some() {
-            return;
+    // DiamaneOS: errors are returned, the guest's access is then refused (no panic).
+    fn ensure_started(&mut self) -> anyhow::Result<()> {
+        if self.diamaneos_worker_failed.load(Ordering::Acquire) {
+            anyhow::bail!("vmwdt worker has failed");
+        }
+        if let Some(worker) = &self.worker_thread {
+            if worker.is_finished() {
+                anyhow::bail!("vmwdt worker has stopped");
+            }
+            return Ok(());
         }
 
+        let result = self.start_and_wait();
+        if result.is_err() {
+            self.diamaneos_worker_failed.store(true, Ordering::Release);
+            if let Err(e) = self.reset_evt_wrtube.send(&VmEventType::DeviceCrashed) {
+                error!("vmwdt startup failure notification: {e:#}");
+            }
+        }
+        result
+    }
+
+    // DiamaneOS: startup failure is terminal, including allocation of the acknowledgement tubes.
+    fn start_and_wait(&mut self) -> anyhow::Result<()> {
         let (worker_started_send, worker_started_recv) =
-            Tube::directional_pair().expect("failed to create vmwdt worker started tubes");
+            Tube::directional_pair().context("failed to create vmwdt worker started tubes")?;
         self.start(Some(worker_started_send))
-            .expect("failed to start Vmwdt");
+            .context("failed to start Vmwdt")?;
         worker_started_recv
             .recv::<()>()
-            .expect("failed to receive vmwdt worker started");
+            .context("failed to receive vmwdt worker started")
+    }
+
+    // DiamaneOS: logs the first refused guest access only, as a guest can repeat them.
+    fn refuse(&self, why: std::fmt::Arguments) {
+        if !self.diamaneos_refused.swap(true, Ordering::Relaxed) {
+            error!("vmwdt: refused: {why} (later refusals are not logged)");
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -348,7 +404,7 @@ impl BusDevice for Vmwdt {
         let data_array = match <&[u8; 4]>::try_from(data) {
             Ok(array) => array,
             _ => {
-                error!("Bad write size: {} for vmwdt", data.len());
+                self.refuse(format_args!("write size {}", data.len()));
                 return;
             }
         };
@@ -357,43 +413,68 @@ impl BusDevice for Vmwdt {
         let cpu_index: usize = (info.offset / VMWDT_REG_LEN) as usize;
         let reg_offset = (info.offset % VMWDT_REG_LEN) as u32;
 
-        if cpu_index > self.vm_wdts.lock().len() {
-            error!("Bad write cpu_index {}", cpu_index);
+        // DiamaneOS: >= (an index equal to the count is past the last vCPU).
+        if cpu_index >= self.vm_wdts.lock().len() {
+            self.refuse(format_args!("write to cpu_index {cpu_index}"));
             return;
         }
 
         match reg_offset {
             VMWDT_REG_STATUS => {
-                self.ensure_started();
+                if let Err(e) = self.ensure_started() {
+                    self.refuse(format_args!("{e:#}"));
+                    return;
+                }
                 let mut wdts_locked = self.vm_wdts.lock();
                 let cpu_watchdog = &mut wdts_locked[cpu_index];
 
-                cpu_watchdog.is_enabled = reg_val != 0;
-
+                // DiamaneOS: on only with a valid frequency, timer errors logged (no panic).
                 if reg_val != 0 {
-                    let interval = Duration::from_millis(1000 / cpu_watchdog.timer_freq_hz);
+                    let Some(interval) = diamaneos_tick(cpu_watchdog.timer_freq_hz) else {
+                        self.refuse(format_args!("cpu {cpu_index} on without a valid frequency"));
+                        return;
+                    };
+                    cpu_watchdog.is_enabled = true;
                     cpu_watchdog.repeating_interval = Some(interval);
-                    cpu_watchdog
-                        .timer
-                        .reset_repeating(interval)
-                        .expect("Failed to reset timer repeating interval");
+                    if let Err(e) = cpu_watchdog.timer.reset_repeating(interval) {
+                        error!("vmwdt: timer of cpu {cpu_index}: {e:#}");
+                    }
                 } else {
+                    cpu_watchdog.is_enabled = false;
                     cpu_watchdog.repeating_interval = None;
-                    cpu_watchdog
-                        .timer
-                        .clear()
-                        .expect("Failed to clear cpu watchdog timer");
+                    if let Err(e) = cpu_watchdog.timer.clear() {
+                        error!("vmwdt: timer of cpu {cpu_index}: {e:#}");
+                    }
                 }
             }
             VMWDT_REG_LOAD_CNT => {
-                self.ensure_started();
-                let (process_id, thread_id) = {
+                if let Err(e) = self.ensure_started() {
+                    self.refuse(format_args!("{e:#}"));
+                    return;
+                }
+                let (process_id, thread_id, timer_freq_hz) = {
                     let mut wdts_locked = self.vm_wdts.lock();
                     let cpu_watchdog = &mut wdts_locked[cpu_index];
-                    (cpu_watchdog.process_id, cpu_watchdog.thread_id)
+                    (
+                        cpu_watchdog.process_id,
+                        cpu_watchdog.thread_id,
+                        cpu_watchdog.timer_freq_hz,
+                    )
                 };
-                let guest_time_ms = Vmwdt::get_guest_time_ms(process_id, thread_id)
-                    .expect("get_guest_time_ms failed");
+                // DiamaneOS: a valid frequency and a readable guest time, or the load is refused.
+                if diamaneos_tick(timer_freq_hz).is_none() {
+                    self.refuse(format_args!(
+                        "cpu {cpu_index} loaded without a valid frequency"
+                    ));
+                    return;
+                }
+                let guest_time_ms = match Vmwdt::get_guest_time_ms(process_id, thread_id) {
+                    Ok(guest_time_ms) => guest_time_ms,
+                    Err(e) => {
+                        self.refuse(format_args!("guest time of cpu {cpu_index}: {e}"));
+                        return;
+                    }
+                };
 
                 let mut wdts_locked = self.vm_wdts.lock();
                 let cpu_watchdog = &mut wdts_locked[cpu_index];
@@ -415,7 +496,7 @@ impl BusDevice for Vmwdt {
                 }
             }
             VMWDT_REG_CURRENT_CNT => {
-                warn!("invalid write to read-only VMWDT_REG_CURRENT_CNT register");
+                self.refuse(format_args!("write to read-only current count"));
             }
             VMWDT_REG_CLOCK_FREQ_HZ => {
                 let mut wdts_locked = self.vm_wdts.lock();
@@ -425,9 +506,15 @@ impl BusDevice for Vmwdt {
                     "CPU:{:x} wrote VMWDT_REG_CLOCK_FREQ_HZ {:x}",
                     cpu_index, reg_val
                 );
+                // DiamaneOS: 1 to 1000 Hz, other values are refused.
+                if diamaneos_tick(reg_val as u64).is_none() {
+                    self.refuse(format_args!("cpu {cpu_index} frequency {reg_val}"));
+                    return;
+                }
                 cpu_watchdog.timer_freq_hz = reg_val as u64;
             }
-            _ => unreachable!(),
+            // DiamaneOS: an offset inside a register is refused (no panic).
+            _ => self.refuse(format_args!("write to offset {:#x}", info.offset)),
         }
     }
 }
@@ -435,12 +522,15 @@ impl BusDevice for Vmwdt {
 impl Suspendable for Vmwdt {
     fn sleep(&mut self) -> anyhow::Result<()> {
         if let Some(worker) = self.worker_thread.take() {
-            self.vm_ctrl_tube = Some(worker.stop());
+            self.vm_ctrl_tube = worker.stop();
         }
         Ok(())
     }
 
     fn wake(&mut self) -> anyhow::Result<()> {
+        if self.diamaneos_worker_failed.load(Ordering::Acquire) {
+            anyhow::bail!("vmwdt worker has failed");
+        }
         if self.activated {
             // We do not pass a tube to notify that the worker thread has started on wake.
             // At this stage, vm_control is blocked on resuming devices and cannot provide the vcpu
@@ -491,6 +581,14 @@ impl Suspendable for Vmwdt {
         self.activated = deser.activated;
         Ok(())
     }
+}
+
+// DiamaneOS: the timer period of a frequency the guest writes, for 1 to 1000 Hz only: no division
+// by zero and no zero period.
+fn diamaneos_tick(timer_freq_hz: u64) -> Option<Duration> {
+    (1..=1000)
+        .contains(&timer_freq_hz)
+        .then(|| Duration::from_millis(1000 / timer_freq_hz))
 }
 
 // DiamaneOS: the vCPU threads' stat files, opened once (own file).
@@ -604,5 +702,114 @@ mod tests {
                 Err(_e) => false,
             }
         });
+    }
+
+    // DiamaneOS: guest accesses with invalid state are refused, none panics.
+
+    /// A device of one vCPU whose worker gets `tid` of this process as the vCPU thread, and the
+    /// control tube's other end, which the worker's request goes to (keep it open).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn device_for(tid: u32) -> (Vmwdt, Tube) {
+        let (vm_evt_wrtube, _vm_evt_rdtube) = Tube::directional_pair().unwrap();
+        let (vm_ctrl_wrtube, vm_ctrl_rdtube) = Tube::pair().unwrap();
+        vm_ctrl_wrtube
+            .send(&VmResponse::VcpuPidTidResponse {
+                pid_tid_map: BTreeMap::from([(0, (process::id(), tid))]),
+            })
+            .unwrap();
+        let device = Vmwdt::new(
+            1,
+            vm_evt_wrtube,
+            IrqEdgeEvent::new().unwrap(),
+            vm_ctrl_rdtube,
+        )
+        .unwrap();
+        (device, vm_ctrl_wrtube)
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn diamaneos_failed_worker_never_looks_active() {
+        let (reset_tx, reset_rx) = Tube::directional_pair().unwrap();
+        let (ctrl_tx, ctrl_rx) = Tube::pair().unwrap();
+        ctrl_tx.send(&VmResponse::Ok).unwrap();
+        let mut device = Vmwdt::new(1, reset_tx, IrqEdgeEvent::new().unwrap(), ctrl_rx).unwrap();
+        assert!(device.ensure_started().is_err());
+        assert!(device.ensure_started().is_err());
+        let ready = WaitContext::build_with(&[(
+            base::ReadNotifier::get_read_notifier(&reset_rx),
+            0usize,
+        )])
+        .unwrap();
+        assert!(ready
+            .wait_timeout(Duration::from_secs(1))
+            .unwrap()
+            .iter()
+            .any(|event| event.is_readable));
+        assert_eq!(
+            reset_rx.recv::<VmEventType>().unwrap(),
+            VmEventType::DeviceCrashed
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn diamaneos_write_past_last_cpu_refused() {
+        let (mut device, _ctrl) = device_for(gettid() as u32);
+        device.write(
+            vmwdt_bus_address(VMWDT_REG_LEN + VMWDT_REG_CLOCK_FREQ_HZ as u64),
+            &[10, 0, 0, 0],
+        );
+        assert_eq!(device.vm_wdts.lock()[0].timer_freq_hz, 0);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn diamaneos_enable_without_frequency_refused() {
+        let (mut device, _ctrl) = device_for(gettid() as u32);
+        device.write(vmwdt_bus_address(VMWDT_REG_STATUS as u64), &[1, 0, 0, 0]);
+        assert!(!device.vm_wdts.lock()[0].is_enabled);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn diamaneos_load_without_frequency_refused() {
+        let (mut device, _ctrl) = device_for(gettid() as u32);
+        device.write(vmwdt_bus_address(VMWDT_REG_LOAD_CNT as u64), &[1, 0, 0, 0]);
+        assert_eq!(device.vm_wdts.lock()[0].next_expiration_interval_ms, 0);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn diamaneos_frequency_out_of_range_refused() {
+        let (mut device, _ctrl) = device_for(gettid() as u32);
+        let freq = vmwdt_bus_address(VMWDT_REG_CLOCK_FREQ_HZ as u64);
+        device.write(freq, &[10, 0, 0, 0]);
+        assert_eq!(device.vm_wdts.lock()[0].timer_freq_hz, 10);
+        device.write(freq, &[0, 0, 0, 0]);
+        assert_eq!(device.vm_wdts.lock()[0].timer_freq_hz, 10);
+        device.write(freq, &5000u32.to_ne_bytes());
+        assert_eq!(device.vm_wdts.lock()[0].timer_freq_hz, 10);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn diamaneos_write_inside_register_refused() {
+        let (mut device, _ctrl) = device_for(gettid() as u32);
+        device.write(vmwdt_bus_address(2), &[1, 0, 0, 0]);
+        assert!(!device.vm_wdts.lock()[0].is_enabled);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn diamaneos_load_without_guest_time_refused() {
+        // A vCPU thread that does not exist: its stat file cannot be read.
+        let (mut device, _ctrl) = device_for(u32::MAX);
+        device.write(
+            vmwdt_bus_address(VMWDT_REG_CLOCK_FREQ_HZ as u64),
+            &[10, 0, 0, 0],
+        );
+        device.write(vmwdt_bus_address(VMWDT_REG_LOAD_CNT as u64), &[1, 0, 0, 0]);
+        assert_eq!(device.vm_wdts.lock()[0].next_expiration_interval_ms, 0);
     }
 }

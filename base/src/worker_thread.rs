@@ -28,17 +28,31 @@ impl<T: Send + 'static> WorkerThread<T> {
     where
         F: FnOnce(Event) -> T + Send + 'static,
     {
-        let stop_event = Event::new().expect("Event::new() failed");
-        let thread_stop_event = stop_event.try_clone().expect("Event::try_clone() failed");
+        // DiamaneOS: callers handling resource failures use try_start directly.
+        Self::try_start(thread_name, thread_func).expect("worker startup failed")
+    }
 
+    /// DiamaneOS: starts a worker without panicking on event, clone or thread allocation failure.
+    pub fn try_start<F>(thread_name: impl Into<String>, thread_func: F) -> std::io::Result<Self>
+    where
+        F: FnOnce(Event) -> T + Send + 'static,
+    {
+        let stop_event = Event::new()?;
+        let thread_stop_event = stop_event.try_clone()?;
         let thread_handle = thread::Builder::new()
             .name(thread_name.into())
-            .spawn(move || thread_func(thread_stop_event))
-            .expect("thread spawn failed");
-
-        WorkerThread {
+            .spawn(move || thread_func(thread_stop_event))?;
+        Ok(WorkerThread {
             worker: Some((stop_event, thread_handle)),
-        }
+        })
+    }
+
+    /// DiamaneOS: a retained handle alone does not establish that a worker is still running.
+    pub fn is_finished(&self) -> bool {
+        self.worker
+            .as_ref()
+            .map(|(_, handle)| handle.is_finished())
+            .unwrap_or(true)
     }
 
     /// Stops the worker thread.
