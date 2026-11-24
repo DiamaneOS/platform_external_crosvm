@@ -165,7 +165,7 @@ impl Default for DiskOption {
     }
 }
 
-// DiamaneOS: the test of DiskOption::raw (our own file).
+// DiamaneOS: the test of DiskOption::raw (own file).
 #[cfg(test)]
 #[path = "diamaneos_raw_test.rs"]
 mod diamaneos_raw_test;

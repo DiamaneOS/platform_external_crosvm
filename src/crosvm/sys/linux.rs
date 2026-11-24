@@ -4,9 +4,13 @@
 
 #[cfg(target_os = "android")]
 mod android;
+// DiamaneOS: crosvm's seccomp filter, installed on Android only (diamaneos_seccomp.rs).
+mod diamaneos_seccomp;
 pub mod cmdline;
 pub mod config;
 mod device_helpers;
+// DiamaneOS: the vCPUs wait for crosvm's seccomp filter (diamaneos_start.rs).
+mod diamaneos_start;
 pub(crate) mod ext2;
 #[cfg(feature = "gpu")]
 pub(crate) mod gpu;
@@ -3920,6 +3924,12 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     } else {
         (run_mode, run_mode)
     };
+    // DiamaneOS: the vCPUs start parked and run once the seccomp filter is on (below).
+    #[cfg(target_os = "android")]
+    let (run_mode, diamaneos_release) = diamaneos_start::park(
+        run_mode,
+        cfg.restore_path.is_some().then_some(post_restore_run_mode),
+    );
 
     // Architecture-specific code must supply a vcpu_init element for each VCPU.
     assert_eq!(vcpus.len(), linux.vcpu_init.len());
@@ -4119,6 +4129,8 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             &linux.vm,
         )?;
         // Allow the vCPUs to start for real.
+        // DiamaneOS: on Android once the seccomp filter is on (below).
+        #[cfg(not(target_os = "android"))]
         vcpu::kick_all_vcpus(
             &vcpu_handles,
             linux.irq_chip.as_irq_chip(),
@@ -4147,6 +4159,21 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     } else {
         None
     };
+
+    // DiamaneOS: setup is done, the vCPUs wait. The watchdog's stat files open first, every one
+    // or the VM does not start, as the seccomp filter refuses openat. Then the filter goes on and
+    // only then do the vCPUs run. A failure sends them Exiting (diamaneos_start.rs).
+    #[cfg(target_os = "android")]
+    diamaneos_start::seal_then_release(
+        diamaneos_release,
+        || {
+            devices::vmwdt::diamaneos_vcpu_stat::open(vcpus_pid_tid.values().copied())
+                .context("vCPU stat files for the watchdog")?;
+            devices::vmwdt::diamaneos_vcpu_stat::seal();
+            diamaneos_seccomp::install().context("seccomp filter")
+        },
+        |msg| vcpu::kick_all_vcpus(&vcpu_handles, linux.irq_chip.as_irq_chip(), msg),
+    )?;
 
     let mut exit_state = ExitState::Stop;
     let mut pvpanic_code = PvPanicCode::Unknown;

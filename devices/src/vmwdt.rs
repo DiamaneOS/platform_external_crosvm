@@ -305,9 +305,15 @@ impl Vmwdt {
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn get_guest_time_ms(process_id: u32, thread_id: u32) -> Result<i64, SysError> {
-        // TODO: @sebastianene check if we can avoid open-read-close on each call
-        let stat_path = format!("/proc/{process_id}/task/{thread_id}/stat");
-        let contents = fs::read_to_string(stat_path)?;
+        // DiamaneOS: a stat file opened before crosvm's seccomp filter, read again with pread.
+        let contents = match diamaneos_vcpu_stat::read(process_id, thread_id) {
+            Some(contents) => contents?,
+            None => {
+                // TODO: @sebastianene check if we can avoid open-read-close on each call
+                let stat_path = format!("/proc/{process_id}/task/{thread_id}/stat");
+                fs::read_to_string(stat_path)?
+            }
+        };
 
         let gtime_ticks = contents
             .split_whitespace()
@@ -486,6 +492,11 @@ impl Suspendable for Vmwdt {
         Ok(())
     }
 }
+
+// DiamaneOS: the vCPU threads' stat files, opened once (own file).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[path = "diamaneos_vcpu_stat.rs"]
+pub mod diamaneos_vcpu_stat;
 
 #[cfg(test)]
 mod tests {
